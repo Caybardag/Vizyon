@@ -1,0 +1,6 @@
+{
+  "name": "NexusIP — Çoklu Oturum ve Hedef Keşif Orkestratörü",
+  "description": "En az 30 farklı IP ve izole tarayıcı oturumuyla gerçek zamanlı hedef bağlantı, YouTube video doğrulama ve kullanıcı/görsel keşfi yapan açık kaynaklı otomasyon sistemi.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
