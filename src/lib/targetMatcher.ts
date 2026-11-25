@@ -1,4 +1,9 @@
 import type { ParsedProxyEndpoint, ProxyNetworkType, ProxyProtocol } from '../types/automation';
+import {
+  buildCoherentFingerprint,
+  type CoherentSessionFingerprint,
+  type ProxyGeoContext,
+} from './fingerprintLayer';
 
 const YOUTUBE_TRACKING_PARAMS = new Set([
   'si',
@@ -134,6 +139,28 @@ export function isExactTargetMatch(candidateUrl: string, targetUrl: string): Tar
     candidateVideoId,
     targetVideoId,
   };
+}
+
+export function isDirectYouTubeWatchHref(rawHref: string, targetVideoId: string): boolean {
+  const trimmed = rawHref.trim();
+  if (!trimmed || !targetVideoId) return false;
+  const lower = trimmed.toLowerCase();
+  // Never click YouTube Mix/Radio playlists (e.g. list=RD...&start_radio=1) or Google ad redirect links
+  if (
+    lower.includes('list=rd') ||
+    lower.includes('start_radio=') ||
+    lower.includes('googleadservices.com') ||
+    lower.includes('/pagead/') ||
+    lower.includes('/aclk?')
+  ) {
+    return false;
+  }
+  const resolved = trimmed.startsWith('http')
+    ? trimmed
+    : trimmed.startsWith('/')
+    ? `https://www.youtube.com${trimmed}`
+    : `https://www.youtube.com/${trimmed}`;
+  return extractYouTubeVideoId(resolved) === targetVideoId;
 }
 
 export function parseProxyLines(
@@ -334,6 +361,18 @@ export function extractYouTubeCandidatesFromJson(json: unknown): ParsedSearchCan
 
     const record = node as Record<string, unknown>;
 
+    // Never extract sponsored ads or YouTube Mix/Radio playlists as organic target matches
+    if (
+      record.adSlotRenderer ||
+      record.promotedVideoRenderer ||
+      record.promotedSparklesWebRenderer ||
+      record.searchPyvRenderer ||
+      record.radioRenderer ||
+      record.inStreamAdLayoutRenderer
+    ) {
+      continue;
+    }
+
     // Standard video renderers (videoRenderer, compactVideoRenderer, gridVideoRenderer, playlistVideoRenderer)
     const rendererKey = (
       ['videoRenderer', 'compactVideoRenderer', 'gridVideoRenderer', 'playlistVideoRenderer'] as const
@@ -374,15 +413,17 @@ export function extractYouTubeCandidatesFromJson(json: unknown): ParsedSearchCan
       }
     }
 
-    // Modern YouTube lockupViewModel
+    // Modern YouTube lockupViewModel (skip Mix / Radio lockups whose playlistId starts with RD)
     const lockup = record.lockupViewModel as Record<string, unknown> | undefined;
     if (lockup && typeof lockup === 'object') {
+      const contentType = typeof lockup.contentType === 'string' ? lockup.contentType : '';
       const contentId = typeof lockup.contentId === 'string' ? lockup.contentId : null;
       const rendererContext = lockup.rendererContext as Record<string, any> | undefined;
-      const watchVid =
-        rendererContext?.commandContext?.onTap?.innertubeCommand?.watchEndpoint?.videoId ??
-        contentId;
-      if (typeof watchVid === 'string' && /^[a-zA-Z0-9_-]{11}$/.test(watchVid)) {
+      const watchEndpoint = rendererContext?.commandContext?.onTap?.innertubeCommand?.watchEndpoint;
+      const playlistId = typeof watchEndpoint?.playlistId === 'string' ? watchEndpoint.playlistId : '';
+      const isRadioMix = contentType === 'LOCKUP_CONTENT_TYPE_PLAYLIST' || playlistId.startsWith('RD');
+      const watchVid = watchEndpoint?.videoId ?? contentId;
+      if (!isRadioMix && typeof watchVid === 'string' && /^[a-zA-Z0-9_-]{11}$/.test(watchVid)) {
         const md = lockup.metadata as Record<string, any> | undefined;
         const lockupMd = md?.lockupMetadataViewModel as Record<string, any> | undefined;
         const title = readTextRun(lockupMd?.title) || `YouTube Video (${watchVid})`;
@@ -390,10 +431,13 @@ export function extractYouTubeCandidatesFromJson(json: unknown): ParsedSearchCan
       }
     }
 
-    // Direct watchEndpoint / videoId fallback inside item nodes
+    // Direct watchEndpoint / videoId fallback inside organic item nodes (skip Mix endpoints)
+    const directNavPlaylist = (record.navigationEndpoint as Record<string, any> | undefined)?.watchEndpoint
+      ?.playlistId;
     if (
       typeof record.videoId === 'string' &&
       /^[a-zA-Z0-9_-]{11}$/.test(record.videoId) &&
+      !(typeof directNavPlaylist === 'string' && directNavPlaylist.startsWith('RD')) &&
       !seenIds.has(record.videoId)
     ) {
       const title =
@@ -409,7 +453,18 @@ export function extractYouTubeCandidatesFromJson(json: unknown): ParsedSearchCan
 
     const keys = Object.keys(record);
     for (let i = keys.length - 1; i >= 0; i--) {
-      const val = record[keys[i]];
+      const key = keys[i];
+      if (
+        key === 'adSlotRenderer' ||
+        key === 'promotedVideoRenderer' ||
+        key === 'promotedSparklesWebRenderer' ||
+        key === 'searchPyvRenderer' ||
+        key === 'radioRenderer' ||
+        key === 'inStreamAdLayoutRenderer'
+      ) {
+        continue;
+      }
+      const val = record[key];
       if (val && typeof val === 'object') {
         stack.push(val);
       }
@@ -620,88 +675,19 @@ export function classifyNetworkType(
   return 'unknown';
 }
 
-export interface GeoMatchedFingerprint {
-  userAgent: string;
-  viewport: { width: number; height: number };
-  locale: string;
-  timezoneId: string;
-  acceptLanguage: string;
-}
-
-const COUNTRY_GEO_PROFILE: Record<string, { locale: string; timezoneId: string; acceptLanguage: string }> = {
-  TR: { locale: 'tr-TR', timezoneId: 'Europe/Istanbul', acceptLanguage: 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7' },
-  US: { locale: 'en-US', timezoneId: 'America/New_York', acceptLanguage: 'en-US,en;q=0.9' },
-  GB: { locale: 'en-GB', timezoneId: 'Europe/London', acceptLanguage: 'en-GB,en;q=0.9' },
-  CA: { locale: 'en-CA', timezoneId: 'America/Toronto', acceptLanguage: 'en-CA,en;q=0.9,fr-CA;q=0.8' },
-  DE: { locale: 'de-DE', timezoneId: 'Europe/Berlin', acceptLanguage: 'de-DE,de;q=0.9,en;q=0.8' },
-  FR: { locale: 'fr-FR', timezoneId: 'Europe/Paris', acceptLanguage: 'fr-FR,fr;q=0.9,en;q=0.8' },
-  NL: { locale: 'nl-NL', timezoneId: 'Europe/Amsterdam', acceptLanguage: 'nl-NL,nl;q=0.9,en;q=0.8' },
-  ES: { locale: 'es-ES', timezoneId: 'Europe/Madrid', acceptLanguage: 'es-ES,es;q=0.9,en;q=0.8' },
-  MX: { locale: 'es-MX', timezoneId: 'America/Mexico_City', acceptLanguage: 'es-MX,es;q=0.9,en;q=0.8' },
-  BR: { locale: 'pt-BR', timezoneId: 'America/Sao_Paulo', acceptLanguage: 'pt-BR,pt;q=0.9,en;q=0.8' },
-  IT: { locale: 'it-IT', timezoneId: 'Europe/Rome', acceptLanguage: 'it-IT,it;q=0.9,en;q=0.8' },
-  PL: { locale: 'pl-PL', timezoneId: 'Europe/Warsaw', acceptLanguage: 'pl-PL,pl;q=0.9,en;q=0.8' },
-  ID: { locale: 'id-ID', timezoneId: 'Asia/Jakarta', acceptLanguage: 'id-ID,id;q=0.9,en;q=0.8' },
-  IN: { locale: 'en-IN', timezoneId: 'Asia/Kolkata', acceptLanguage: 'en-IN,en;q=0.9,hi;q=0.8' },
-  JP: { locale: 'ja-JP', timezoneId: 'Asia/Tokyo', acceptLanguage: 'ja-JP,ja;q=0.9,en;q=0.8' },
-  KR: { locale: 'ko-KR', timezoneId: 'Asia/Seoul', acceptLanguage: 'ko-KR,ko;q=0.9,en;q=0.8' },
-  SG: { locale: 'en-SG', timezoneId: 'Asia/Singapore', acceptLanguage: 'en-SG,en;q=0.9' },
-  MY: { locale: 'ms-MY', timezoneId: 'Asia/Kuala_Lumpur', acceptLanguage: 'ms-MY,ms;q=0.9,en;q=0.8' },
-  HK: { locale: 'zh-HK', timezoneId: 'Asia/Hong_Kong', acceptLanguage: 'zh-HK,zh;q=0.9,en;q=0.8' },
-  AU: { locale: 'en-AU', timezoneId: 'Australia/Sydney', acceptLanguage: 'en-AU,en;q=0.9' },
-};
-
-const USER_AGENTS_AND_VIEWPORTS = [
-  {
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    viewport: { width: 1366, height: 768 },
-  },
-  {
-    userAgent:
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-    viewport: { width: 1440, height: 900 },
-  },
-  {
-    userAgent:
-      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    viewport: { width: 1280, height: 800 },
-  },
-  {
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
-    viewport: { width: 1536, height: 864 },
-  },
-  {
-    userAgent:
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    viewport: { width: 1280, height: 720 },
-  },
-  {
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-    viewport: { width: 1600, height: 900 },
-  },
-];
+export type GeoMatchedFingerprint = CoherentSessionFingerprint;
 
 export function pickGeoMatchedFingerprint(
   countryCode: string | null | undefined,
-  sessionIndex: number
+  sessionIndex: number,
+  geoContext?: Omit<ProxyGeoContext, 'countryCode'>
 ): GeoMatchedFingerprint {
-  const base = USER_AGENTS_AND_VIEWPORTS[Math.abs(sessionIndex) % USER_AGENTS_AND_VIEWPORTS.length];
-  const cc = (countryCode || '').trim().toUpperCase();
-  const geo = COUNTRY_GEO_PROFILE[cc] ?? {
-    locale: 'en-US',
-    timezoneId: 'America/New_York',
-    acceptLanguage: 'en-US,en;q=0.9',
-  };
-  return {
-    userAgent: base.userAgent,
-    viewport: base.viewport,
-    locale: geo.locale,
-    timezoneId: geo.timezoneId,
-    acceptLanguage: geo.acceptLanguage,
-  };
+  return buildCoherentFingerprint(sessionIndex, {
+    countryCode,
+    timezone: geoContext?.timezone,
+    lat: geoContext?.lat,
+    lon: geoContext?.lon,
+  });
 }
 
 export interface TrafficGateInspection {
@@ -743,7 +729,25 @@ export function detectTrafficGateFromPage(
     lowerBody.includes('log in om te bevestigen dat je geen bot bent') ||
     lowerBody.includes('inicia sesión para confirmar que no eres un bot') ||
     lowerBody.includes('accedi per confermare che non sei un bot') ||
-    lowerBody.includes('faça login para confirmar que não é um robô')
+    lowerBody.includes('faça login para confirmar que não é um robô') ||
+    lowerBody.includes('zaloguj się, by potwierdzić, że nie jesteś botem') ||
+    lowerBody.includes('zaloguj się, aby potwierdzić, że nie jesteś botem') ||
+    lowerBody.includes('přihlaste se, abyste potvrdili, že nejste robot') ||
+    lowerBody.includes('conectează-te pentru a confirma că nu ești un bot') ||
+    lowerBody.includes('jelentkezz be, hogy igazold, nem vagy robot') ||
+    lowerBody.includes('войдите в аккаунт, чтобы подтвердить, что вы не робот') ||
+    lowerBody.includes('войдите, чтобы подтвердить, что вы не робот') ||
+    lowerBody.includes('увійдіть, щоб підтвердити, що ви не робот') ||
+    lowerBody.includes('請登入以確認你並非機械人') ||
+    lowerBody.includes('請登入以確認你不是機器人') ||
+    lowerBody.includes('请登录以确认您不是机器人') ||
+    lowerBody.includes('登录以确认你不是机器人') ||
+    lowerBody.includes('bot ではないことを確認') ||
+    lowerBody.includes('ロボットではないことを確認') ||
+    lowerBody.includes('봇이 아님을 확인') ||
+    lowerBody.includes('xác nhận bạn không phải là rô-bốt') ||
+    lowerBody.includes('xác nhận bạn không phải là bot') ||
+    lowerBody.includes('konfirmasi bahwa anda bukan bot')
   ) {
     return {
       blocked: true,
@@ -755,12 +759,16 @@ export function detectTrafficGateFromPage(
   if (
     lowerTitle.includes('429') ||
     lowerBody.includes('too many requests') ||
-    lowerBody.includes('rate limit exceeded')
+    lowerBody.includes('rate limit exceeded') ||
+    lowerTitle.includes('403 forbidden') ||
+    lowerTitle.includes('attention required') ||
+    lowerBody.includes('checking your browser before accessing') ||
+    lowerBody.includes('verify you are human')
   ) {
     return {
       blocked: true,
       gateType: 'rate-limit',
-      reason: 'Hedef sunucu hız sınırı (HTTP 429) uyguladı',
+      reason: 'Hedef sunucu hız sınırı veya WAF engeli (HTTP 403/429) uyguladı',
     };
   }
 
@@ -807,6 +815,13 @@ export function isRetryableProxyErrorMessage(message: string): boolean {
     lower.includes('err_proxy_connection_failed') ||
     lower.includes('err_tunnel_connection_failed') ||
     lower.includes('err_socks_connection_failed') ||
+    lower.includes('err_connection_reset') ||
+    lower.includes('err_connection_timed_out') ||
+    lower.includes('err_connection_closed') ||
+    lower.includes('err_name_not_resolved') ||
+    lower.includes('err_ssl_protocol_error') ||
+    lower.includes('net::err_') ||
+    lower.includes('page.goto: timeout') ||
     lower.includes('socket closed') ||
     lower.includes('response aborted') ||
     lower.includes('request timeout') ||
@@ -814,8 +829,17 @@ export function isRetryableProxyErrorMessage(message: string): boolean {
     lower.includes('unexpected token') ||
     lower.includes('not valid json') ||
     lower.includes('remote_addr') ||
-    lower.includes('proxy hedef yerine')
+    lower.includes('proxy hedef yerine') ||
+    lower.includes('http 403') ||
+    lower.includes('http 429') ||
+    lower.includes('bot-gate-detected')
   );
+}
+
+export function isQuarantineWorthyBlock(statusCode: number | null, trafficStatus: string): boolean {
+  if (trafficStatus === 'bot-gate-detected') return true;
+  if (statusCode === 403 || statusCode === 429) return true;
+  return false;
 }
 
 export function safeJsonParse<T>(rawBody: string): T {

@@ -68,11 +68,24 @@ export function SessionDetailModal({ session, onClose }: SessionDetailModalProps
               </div>
             </div>
             <div className="sm:col-span-2">
-              <div className="text-xs text-slate-500">İzole Tarayıcı Kimliği (User-Agent · Coğrafi Yerel Ayar)</div>
+              <div className="text-xs text-slate-500">
+                İzole Tarayıcı Kimliği &amp; Katman Tutarlılığı
+                {typeof session.consistencyScore === 'number' ? ` (%${session.consistencyScore} Uyumlu)` : ''}
+              </div>
               <div className="font-mono text-xs text-slate-700 mt-0.5 break-all">
                 {session.userAgent} · {session.locale}
                 {session.timezoneId ? ` · ${session.timezoneId}` : ''}
               </div>
+              {(session.osPlatform || session.webglRenderer || session.tlsProfile) && (
+                <div className="font-mono text-[11px] text-slate-500 mt-1 break-all">
+                  {session.osPlatform ? `${session.osPlatform}` : ''}
+                  {session.screenResolution ? ` · ${session.screenResolution}` : ''}
+                  {session.webglRenderer ? ` · ${session.webglRenderer}` : ''}
+                  {session.tlsProfile ? ` · TLS: ${session.tlsProfile}` : ''}
+                  {session.cdpHardened ? ' · CDP Korumalı' : ''}
+                  {session.behaviorMode === 'bezier-human' ? ' · Bézier Davranış' : ''}
+                </div>
+              )}
             </div>
             <div>
               <div className="text-xs text-slate-500">Çerez Penceresi &amp; Trafik Kontrolü</div>
@@ -84,6 +97,9 @@ export function SessionDetailModal({ session, onClose }: SessionDetailModalProps
                   : session.trafficStatus === 'clear'
                   ? 'Temiz erişim (engel yok)'
                   : 'Beklemede'}
+                {(session.failoverCount ?? 0) > 0 && (
+                  <span className="text-slate-600">{` · Otomatik rotasyon: ${session.failoverCount}`}</span>
+                )}
               </div>
             </div>
             <div>
@@ -139,6 +155,8 @@ export function SessionDetailModal({ session, onClose }: SessionDetailModalProps
                     ? 'Isınmış çerez profili kullanıldı'
                     : session.profileState === 'warmed'
                     ? 'Oturum öncesi ısıtıldı'
+                    : session.profileState === 'quarantined'
+                    ? 'Engel sonrası karantinaya alındı'
                     : 'Soğuk oturum'}
                 </span>
                 {session.sessionDepthTitle && (

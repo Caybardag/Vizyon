@@ -18,7 +18,11 @@ import {
 import type { TargetMetadataHint } from '../src/lib/targetMatcher';
 import { eventBus } from './eventBus';
 import { proxyPool } from './proxyPool';
-import { clampMinWatchSeconds, isRetryableProxyErrorMessage } from '../src/lib/targetMatcher';
+import {
+  clampMinWatchSeconds,
+  isQuarantineWorthyBlock,
+  isRetryableProxyErrorMessage,
+} from '../src/lib/targetMatcher';
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const RUNS_FILE = path.join(DATA_DIR, 'runs.json');
@@ -126,7 +130,11 @@ class RunOrchestrator {
     const targetWatchSeconds = clampMinWatchSeconds(config.minWatchSeconds, 60);
 
     const initialSessions: SessionExecution[] = assignedProxies.map((proxy, idx) => {
-      const fp = pickFingerprint(idx, proxy?.countryCode);
+      const fp = pickFingerprint(idx + 1, proxy?.countryCode, {
+        timezone: proxy?.timezone,
+        lat: proxy?.lat,
+        lon: proxy?.lon,
+      });
       return {
         sessionId: `${runId}-ctx-${String(idx + 1).padStart(2, '0')}`,
         sessionIndex: idx + 1,
@@ -135,10 +143,19 @@ class RunOrchestrator {
         protocol: proxy ? proxy.protocol : 'https',
         exitIp: proxy?.exitIp || 'Yerel Çıkış',
         country: proxy?.country || 'Direct',
+        countryCode: proxy?.countryCode ?? null,
         networkType: proxy?.networkType || 'unknown',
         userAgent: fp.userAgent,
         locale: fp.locale,
         timezoneId: fp.timezoneId,
+        osPlatform: `${fp.uaPlatform} (${fp.platform})`,
+        webglRenderer: fp.webglRenderer,
+        screenResolution: `${fp.screen.width}x${fp.screen.height}`,
+        consistencyScore: fp.consistencyScore,
+        cdpHardened: true,
+        tlsProfile: fp.tlsProfile,
+        behaviorMode: config.humanizeWatchCurve !== false ? 'bezier-human' : 'standard',
+        failoverCount: 0,
         status: 'queued',
         searchQuery: config.searchQuery || config.targetUrl || config.username,
         matchedQuery: null,
@@ -301,21 +318,29 @@ class RunOrchestrator {
           signal.removeEventListener('abort', onParentAbort);
         }
 
-        if (
-          res.status === 'proxy-error' &&
-          currentProxy &&
-          !signal.aborted &&
-          isRetryableProxyErrorMessage(res.error || '')
-        ) {
+        const isProxyFailure =
+          res.status === 'proxy-error' && isRetryableProxyErrorMessage(res.error || '');
+        const isBlockGate = isQuarantineWorthyBlock(res.httpStatus, res.trafficStatus);
+
+        if ((isProxyFailure || isBlockGate) && currentProxy && !signal.aborted) {
           failedProxyIds.add(currentProxy.id);
-          proxyPool.markProxyFailed(currentProxy.id, res.error || 'Oturum proxy hatası');
+          proxyPool.markProxyFailed(
+            currentProxy.id,
+            isBlockGate
+              ? res.trafficGateReason || `HTTP ${res.httpStatus ?? 403} bot/WAF engeli`
+              : res.error || 'Oturum proxy hatası'
+          );
 
           if (attempt < maxRetries) {
             const backup = proxyPool.acquireHealthyReserveProxy(usedExitIps, failedProxyIds);
             if (backup && backup.exitIp) {
               usedExitIps.add(backup.exitIp);
               currentProxy = backup;
-              const nextFp = pickFingerprint(currentSess.sessionIndex, backup.countryCode);
+              const nextFp = pickFingerprint(`${backup.id}-retry-${attempt + 1}`, backup.countryCode, {
+                timezone: backup.timezone,
+                lat: backup.lat,
+                lon: backup.lon,
+              });
               currentSess = {
                 ...currentSess,
                 proxyId: backup.id,
@@ -323,11 +348,22 @@ class RunOrchestrator {
                 protocol: backup.protocol,
                 exitIp: backup.exitIp,
                 country: backup.country || 'Bilinmiyor',
+                countryCode: backup.countryCode ?? null,
                 networkType: backup.networkType || 'unknown',
                 userAgent: nextFp.userAgent,
                 locale: nextFp.locale,
                 timezoneId: nextFp.timezoneId,
+                osPlatform: `${nextFp.uaPlatform} (${nextFp.platform})`,
+                webglRenderer: nextFp.webglRenderer,
+                screenResolution: `${nextFp.screen.width}x${nextFp.screen.height}`,
+                consistencyScore: nextFp.consistencyScore,
+                cdpHardened: true,
+                tlsProfile: nextFp.tlsProfile,
+                behaviorMode: config.humanizeWatchCurve !== false ? 'bezier-human' : 'standard',
+                failoverCount: (currentSess.failoverCount ?? 0) + 1,
                 status: 'queued',
+                trafficStatus: 'unknown',
+                trafficGateReason: null,
                 error: null,
                 candidatesInspected: 0,
                 candidatesSkipped: 0,

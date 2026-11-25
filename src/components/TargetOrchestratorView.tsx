@@ -223,6 +223,21 @@ export function TargetOrchestratorView({
       0
     );
 
+    const scoredSessions = activeRun.sessions.filter(
+      (s) => typeof s.consistencyScore === 'number'
+    );
+    const avgConsistency =
+      scoredSessions.length > 0
+        ? Math.round(
+            scoredSessions.reduce((sum, s) => sum + (s.consistencyScore ?? 100), 0) /
+              scoredSessions.length
+          )
+        : 100;
+    const totalFailovers = activeRun.sessions.reduce(
+      (sum, s) => sum + (s.failoverCount ?? 0),
+      0
+    );
+
     return {
       bestRank,
       bestPage,
@@ -235,6 +250,8 @@ export function TargetOrchestratorView({
       avgWatchSeconds,
       watchtimePingSessions,
       totalWatchtimePings,
+      avgConsistency,
+      totalFailovers,
     };
   }, [activeRun]);
 
@@ -244,6 +261,30 @@ export function TargetOrchestratorView({
   const renderSessionStatus = (sess: SessionExecution) => {
     switch (sess.status) {
       case 'matched':
+        if (sess.trafficStatus === 'bot-gate-detected' || sess.playbackStatus === 'blocked') {
+          return (
+            <span className="inline-flex items-center gap-1.5 text-amber-700 font-medium">
+              <ShieldAlert className="w-3.5 h-3.5 shrink-0" />
+              <span>Bot / CAPTCHA Engeli</span>
+            </span>
+          );
+        }
+        if ((sess.targetWatchSeconds ?? 0) > 0 && sess.playbackStatus === 'stalled') {
+          return (
+            <span className="inline-flex items-center gap-1.5 text-amber-700 font-medium">
+              <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+              <span>Akış Durakladı</span>
+            </span>
+          );
+        }
+        if ((sess.targetWatchSeconds ?? 0) > 0 && sess.playbackStatus === 'no-video') {
+          return (
+            <span className="inline-flex items-center gap-1.5 text-amber-700 font-medium">
+              <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+              <span>Oynatıcı Yüklenemedi</span>
+            </span>
+          );
+        }
         return (
           <span className="inline-flex items-center gap-1.5 text-emerald-700 font-medium">
             <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
@@ -769,9 +810,9 @@ export function TargetOrchestratorView({
                   </div>
                 </div>
                 <div>
-                  <div className="text-slate-500">Trafik / Bot Doğrulama Engeli</div>
+                  <div className="text-slate-500">Katman Tutarlılığı &amp; Rotasyon</div>
                   <div className="font-mono text-slate-900 font-medium mt-0.5 tabular-nums">
-                    {discoverabilityStats.botGates} oturum · Telemetri: {discoverabilityStats.watchtimePingSessions}
+                    Tut.: %{discoverabilityStats.avgConsistency} · Engel: {discoverabilityStats.botGates} · Rotasyon: {discoverabilityStats.totalFailovers}
                   </div>
                 </div>
               </div>
@@ -903,18 +944,23 @@ export function TargetOrchestratorView({
                         #{String(sess.sessionIndex).padStart(2, '0')}
                       </td>
                       <td className="py-2.5 px-2 font-mono text-slate-800 whitespace-nowrap tabular-nums">
-                        <span>{sess.exitIp}</span>
-                        {sess.country && (
-                          <span className="text-slate-500 font-sans ml-1">· {sess.country}</span>
-                        )}
-                        {sess.networkType && sess.networkType !== 'unknown' && (
-                          <span
-                            className={`font-sans ml-1 ${
-                              sess.networkType === 'residential-isp' ? 'text-emerald-700' : 'text-amber-700'
-                            }`}
-                          >
-                            · {sess.networkType === 'residential-isp' ? 'ISP' : 'Veri Mrk.'}
-                          </span>
+                        <div>{sess.exitIp}</div>
+                        {(sess.country || (sess.networkType && sess.networkType !== 'unknown')) && (
+                          <div className="font-sans text-[11px] leading-tight mt-0.5">
+                            {sess.country && <span className="text-slate-500">{sess.country}</span>}
+                            {sess.country && sess.networkType && sess.networkType !== 'unknown' && (
+                              <span className="text-slate-400"> · </span>
+                            )}
+                            {sess.networkType && sess.networkType !== 'unknown' && (
+                              <span
+                                className={
+                                  sess.networkType === 'residential-isp' ? 'text-emerald-700' : 'text-amber-700'
+                                }
+                              >
+                                {sess.networkType === 'residential-isp' ? 'ISP' : 'Veri Mrk.'}
+                              </span>
+                            )}
+                          </div>
                         )}
                       </td>
                       <td className="py-2.5 px-2 font-mono uppercase text-slate-600 whitespace-nowrap">
@@ -961,7 +1007,7 @@ export function TargetOrchestratorView({
                         {sess.candidatesInspected} / {sess.candidatesSkipped}
                       </td>
                       <td className="py-2.5 px-2 text-slate-700">
-                        <div className="max-w-[130px] xl:max-w-[220px]">
+                        <div className="max-w-[140px] 2xl:max-w-[220px]">
                           <div className="truncate">
                             {sess.resolvedTitle || sess.error || sess.searchQuery}
                           </div>
@@ -979,6 +1025,8 @@ export function TargetOrchestratorView({
                                 ? 'Isınmış profil'
                                 : sess.profileState === 'warmed'
                                 ? 'Yeni ısıtıldı'
+                                : sess.profileState === 'quarantined'
+                                ? 'Profil karantinada'
                                 : ''}
                               {sess.sessionDepthTitle && ` · +Sonraki: ${sess.sessionDepthTitle}`}
                               {sess.consentDismissed && ` · Çerez geçildi (${sess.consentButtonLabel || 'OK'})`}

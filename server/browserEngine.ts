@@ -3,7 +3,7 @@ import path from 'node:path';
 import http from 'node:http';
 import https from 'node:https';
 import crypto from 'node:crypto';
-import { chromium, type Browser, type BrowserContext, type Page } from 'playwright-core';
+import type { Browser, Page } from 'playwright-core';
 import * as cheerio from 'cheerio';
 import type {
   CandidateDecision,
@@ -20,24 +20,54 @@ import {
   computeDHashHammingDistance,
   computeHumanizedWatchTarget,
   computePlaybackAdvance,
-  detectTrafficGateFromPage,
   extractYouTubeCandidatesFromJson,
   extractYouTubeSearchContext,
   extractYouTubeVideoId,
   findContinuationTokenInJson,
   hammingToSimilarityPercent,
+  isDirectYouTubeWatchHref,
   isExactTargetMatch,
-  isYouTubeWatchTelemetryUrl,
-  pickGeoMatchedFingerprint,
+  isRetryableProxyErrorMessage,
   safeJsonParse,
   scoreProfileMatch,
   type ParsedSearchCandidate,
   type TargetMetadataHint,
 } from '../src/lib/targetMatcher';
-import { createProxyAgent, httpsGetWithAgent, httpsPostJsonWithAgent } from './proxyPool';
+import type { Point2D } from '../src/lib/behaviorLayer';
+import {
+  buildChromeAlignedHeaders,
+  createProxyAgent,
+  httpsGetWithAgent,
+  httpsPostJsonWithAgent,
+} from './layers/networkLayer';
+import {
+  createSessionFingerprint,
+  type CoherentSessionFingerprint,
+} from './layers/fingerprintLayer';
+import {
+  acquireIsolatedProfile,
+  getWarmProfilesCount,
+  persistWarmProfile,
+  quarantineProfile,
+} from './layers/profilePoolLayer';
+import {
+  closeContextSafely,
+  createHardenedContext,
+  getSharedBrowser,
+} from './layers/browserLayer';
+import {
+  humanClickLocator,
+  humanMoveMouse,
+  humanScroll,
+} from './layers/behaviorLayer';
+import {
+  attachSessionTelemetry,
+  inspectLiveTrafficGate,
+} from './layers/telemetryLayer';
+
+export { getSharedBrowser, getWarmProfilesCount };
 
 const PROOFS_DIR = path.resolve(process.cwd(), 'data', 'proofs');
-const PROFILES_DIR = path.resolve(process.cwd(), 'data', 'profiles');
 
 function ensureProofsDir(): void {
   if (!fs.existsSync(PROOFS_DIR)) {
@@ -45,88 +75,17 @@ function ensureProofsDir(): void {
   }
 }
 
-function ensureProfilesDir(): void {
-  if (!fs.existsSync(PROFILES_DIR)) {
-    fs.mkdirSync(PROFILES_DIR, { recursive: true });
-  }
-}
-
-function getProfileStoragePath(proxyId: string, sessionIndex: number): string {
-  const rawKey = proxyId && proxyId !== 'direct-local' ? proxyId : `direct-slot-${((sessionIndex - 1) % 8) + 1}`;
-  const safeKey = rawKey.replace(/[^a-zA-Z0-9_-]/g, '_');
-  return path.join(PROFILES_DIR, `${safeKey}.json`);
-}
-
-function hasUsableWarmProfile(filePath: string): boolean {
-  try {
-    if (!fs.existsSync(filePath)) return false;
-    const stat = fs.statSync(filePath);
-    if (stat.size < 40) return false;
-    // Profiles older than 72 hours are refreshed automatically
-    if (Date.now() - stat.mtimeMs > 72 * 60 * 60 * 1000) return false;
-    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8')) as { cookies?: unknown[] };
-    return Array.isArray(parsed.cookies) && parsed.cookies.length > 0;
-  } catch {
-    return false;
-  }
-}
-
-export function getWarmProfilesCount(): number {
-  try {
-    if (!fs.existsSync(PROFILES_DIR)) return 0;
-    return fs.readdirSync(PROFILES_DIR).filter((f) => f.endsWith('.json')).length;
-  } catch {
-    return 0;
-  }
-}
-
-const SESSION_FINGERPRINTS = [
-  {
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    viewport: { width: 1366, height: 768 },
-    locale: 'tr-TR',
-    timezoneId: 'Europe/Istanbul',
-  },
-  {
-    userAgent:
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-    viewport: { width: 1440, height: 900 },
-    locale: 'en-US',
-    timezoneId: 'America/New_York',
-  },
-  {
-    userAgent:
-      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    viewport: { width: 1280, height: 800 },
-    locale: 'de-DE',
-    timezoneId: 'Europe/Berlin',
-  },
-  {
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
-    viewport: { width: 1536, height: 864 },
-    locale: 'en-GB',
-    timezoneId: 'Europe/London',
-  },
-  {
-    userAgent:
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    viewport: { width: 1280, height: 720 },
-    locale: 'fr-FR',
-    timezoneId: 'Europe/Paris',
-  },
-  {
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-    viewport: { width: 1600, height: 900 },
-    locale: 'nl-NL',
-    timezoneId: 'Europe/Amsterdam',
-  },
-];
-
-export function pickFingerprint(index: number, countryCode?: string | null) {
-  return pickGeoMatchedFingerprint(countryCode, index);
+export function pickFingerprint(
+  seedOrIndex: string | number,
+  countryCode?: string | null,
+  geo?: { timezone?: string | null; lat?: number | null; lon?: number | null }
+): CoherentSessionFingerprint {
+  return createSessionFingerprint(seedOrIndex, {
+    countryCode,
+    timezone: geo?.timezone,
+    lat: geo?.lat,
+    lon: geo?.lon,
+  });
 }
 
 export async function fetchTargetMetadata(targetUrl: string): Promise<TargetMetadataHint> {
@@ -175,58 +134,6 @@ export async function fetchTargetMetadata(targetUrl: string): Promise<TargetMeta
   return {};
 }
 
-function findChromiumExecutable(): string | undefined {
-  const roots = ['/ms-playwright'];
-  for (const root of roots) {
-    if (!fs.existsSync(root)) continue;
-    const entries = fs.readdirSync(root);
-    for (const entry of entries) {
-      const candidate1 = path.join(root, entry, 'chrome-headless-shell-linux64', 'chrome-headless-shell');
-      if (fs.existsSync(candidate1)) return candidate1;
-      const candidate2 = path.join(root, entry, 'chrome-linux', 'chrome');
-      if (fs.existsSync(candidate2)) return candidate2;
-    }
-  }
-  return undefined;
-}
-
-let sharedBrowserPromise: Promise<Browser> | null = null;
-
-export async function getSharedBrowser(): Promise<Browser> {
-  if (!sharedBrowserPromise) {
-    const executablePath = findChromiumExecutable();
-    sharedBrowserPromise = chromium
-      .launch({
-        executablePath,
-        headless: true,
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-gpu',
-          '--disable-background-networking',
-          '--autoplay-policy=no-user-gesture-required',
-          '--mute-audio',
-          '--disable-background-timer-throttling',
-          '--disable-renderer-backgrounding',
-          '--disable-backgrounding-occluded-windows',
-          '--disable-blink-features=AutomationControlled',
-        ],
-      })
-      .then((browser) => {
-        browser.on('disconnected', () => {
-          sharedBrowserPromise = null;
-        });
-        return browser;
-      })
-      .catch((err) => {
-        sharedBrowserPromise = null;
-        throw err;
-      });
-  }
-  return sharedBrowserPromise;
-}
-
 function fetchBinaryAsDataUrl(url: string, timeoutMs = 6000): Promise<string | null> {
   if (url.startsWith('data:image/')) return Promise.resolve(url);
 
@@ -242,7 +149,7 @@ function fetchBinaryAsDataUrl(url: string, timeoutMs = 6000): Promise<string | n
           method: 'GET',
           timeout: timeoutMs,
           headers: {
-            'User-Agent': SESSION_FINGERPRINTS[0].userAgent,
+            ...buildChromeAlignedHeaders(),
             Accept: 'image/*,*/*;q=0.8',
           },
         },
@@ -416,13 +323,6 @@ const CONSENT_BUTTON_SELECTORS = [
   'button:has-text("I agree")',
   '#onetrust-accept-btn-handler',
 ];
-
-async function closeContextSafely(context: BrowserContext): Promise<void> {
-  await Promise.race([
-    context.close().catch(() => undefined),
-    new Promise<void>((resolve) => setTimeout(resolve, 2500)),
-  ]);
-}
 
 function withHardTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
   let timer: NodeJS.Timeout | null = null;
@@ -695,13 +595,31 @@ export async function runExactLinkSession(params: {
   onUpdate: (updated: SessionExecution) => void;
 }): Promise<SessionExecution> {
   const { runId, proxy, config, targetMetadata, signal, onUpdate } = params;
-  const fp = pickGeoMatchedFingerprint(proxy?.countryCode, params.session.sessionIndex);
+  const profileUnit = acquireIsolatedProfile(
+    params.session.proxyId,
+    params.session.sessionIndex,
+    proxy?.countryCode ?? null,
+    config.enableProfileWarmup !== false
+  );
+  const fp = pickFingerprint(profileUnit.fingerprintSeed, proxy?.countryCode, {
+    timezone: proxy?.timezone,
+    lat: proxy?.lat,
+    lon: proxy?.lon,
+  });
 
   let current: SessionExecution = {
     ...params.session,
+    countryCode: proxy?.countryCode ?? params.session.countryCode ?? null,
     userAgent: fp.userAgent,
     locale: fp.locale,
     timezoneId: fp.timezoneId,
+    osPlatform: `${fp.uaPlatform} (${fp.platform})`,
+    webglRenderer: fp.webglRenderer,
+    screenResolution: `${fp.screen.width}x${fp.screen.height}`,
+    consistencyScore: fp.consistencyScore,
+    cdpHardened: true,
+    tlsProfile: fp.tlsProfile,
+    behaviorMode: config.humanizeWatchCurve !== false ? 'bezier-human' : 'standard',
     networkType: proxy?.networkType ?? params.session.networkType ?? 'unknown',
     status: 'initializing',
     updatedAt: new Date().toISOString(),
@@ -709,45 +627,17 @@ export async function runExactLinkSession(params: {
   onUpdate(current);
 
   const startedAt = Date.now();
-  const browser = await getSharedBrowser();
-
-  const proxyConfig = proxy
-    ? {
-        server: `${proxy.protocol}://${proxy.host}:${proxy.port}`,
-      }
-    : undefined;
-
-  const profilePath = getProfileStoragePath(params.session.proxyId, params.session.sessionIndex);
-  const loadedWarmProfile = config.enableProfileWarmup !== false && hasUsableWarmProfile(profilePath);
-  let profileState: ProfileWarmupState = loadedWarmProfile ? 'reused-warm' : 'cold';
-
-  const context = await browser.newContext({
-    proxy: proxyConfig,
-    userAgent: fp.userAgent,
-    viewport: fp.viewport,
-    locale: fp.locale,
-    timezoneId: fp.timezoneId,
-    ignoreHTTPSErrors: true,
-    ...(loadedWarmProfile ? { storageState: profilePath } : {}),
-    extraHTTPHeaders: {
-      'Accept-Language': fp.acceptLanguage,
-    },
+  const context = await createHardenedContext({
+    proxy,
+    fingerprint: fp,
+    profileUnit,
   });
-
-  await context.addInitScript((lang: string) => {
-    try {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-      Object.defineProperty(navigator, 'languages', { get: () => [lang, lang.split('-')[0] || 'en'] });
-      (window as unknown as { chrome?: unknown }).chrome = {
-        runtime: {},
-        loadTimes: () => ({}),
-        csi: () => ({}),
-      };
-    } catch {
-      // Ignore init script errors
-    }
-  }, fp.locale);
+  let profileState: ProfileWarmupState = profileUnit.state;
+  const loadedWarmProfile = profileState === 'reused-warm';
+  let cursorPos: Point2D = {
+    x: Math.round(fp.viewport.width * 0.42),
+    y: Math.round(fp.viewport.height * 0.38),
+  };
 
   const maxSearchPages = Math.max(1, Math.min(5, config.maxSearchPages ?? 3));
   const minWatchSeconds = clampMinWatchSeconds(config.minWatchSeconds, 60);
@@ -772,21 +662,13 @@ export async function runExactLinkSession(params: {
         const page = await context.newPage();
         page.setDefaultTimeout(8500);
 
-        let watchtimePingCount = 0;
-        let lastWatchtimePingStatus: number | null = null;
-        page.on('response', (res) => {
-          try {
-            if (isYouTubeWatchTelemetryUrl(res.url())) {
-              const status = res.status();
-              if (status >= 200 && status < 400) {
-                watchtimePingCount++;
-                lastWatchtimePingStatus = status;
-              }
-            }
-          } catch {
-            // Ignore response listener errors
-          }
-        });
+        let targetHostHint = '';
+        try {
+          targetHostHint = new URL(config.targetUrl).hostname.replace(/^www\./, '').toLowerCase();
+        } catch {
+          targetHostHint = '';
+        }
+        const telemetry = attachSessionTelemetry(page, targetHostHint);
 
         const isYouTubeTarget = Boolean(extractYouTubeVideoId(config.targetUrl));
         if (isYouTubeTarget && !loadedWarmProfile) {
@@ -838,9 +720,12 @@ export async function runExactLinkSession(params: {
                 };
               }
             }
-            await page.mouse.wheel(0, 420).catch(() => undefined);
-            await page.waitForTimeout(1100);
-            profileState = 'warmed';
+            if (humanizeWatchCurve) {
+              await humanScroll(page, 380, current.sessionIndex * 31 + 7);
+            } else {
+              await page.mouse.wheel(0, 420).catch(() => undefined);
+            }
+            await page.waitForTimeout(950);
           } catch {
             // Warm-up failure is non-fatal; continue directly to target search
           }
@@ -927,6 +812,8 @@ export async function runExactLinkSession(params: {
           return false;
         };
 
+        let lastSearchProxyError: string | null = null;
+
         for (let queryIdx = 0; queryIdx < queries.length; queryIdx++) {
           const query = queries[queryIdx];
           if (signal.aborted || hardTimedOut || matchState.candidate || Date.now() > searchDeadlineAt) break;
@@ -976,12 +863,22 @@ export async function runExactLinkSession(params: {
                 if (page1Candidates.length === 0) {
                   const domLinks = await page.evaluate(() => {
                     const anchors = Array.from(document.querySelectorAll('a#video-title, a[href*="/watch?v="]'));
-                    return anchors.slice(0, 35).map((a) => ({
-                      href: (a as HTMLAnchorElement).href,
-                      title: (a.textContent || '').trim(),
-                    }));
+                    return anchors
+                      .filter(
+                        (a) =>
+                          !a.closest(
+                            'ytd-ad-slot-renderer, ytd-promoted-sparkles-web-renderer, ytd-promoted-video-renderer, ytd-radio-renderer'
+                          )
+                      )
+                      .slice(0, 35)
+                      .map((a) => ({
+                        href: (a as HTMLAnchorElement).href,
+                        title: (a.textContent || '').trim(),
+                      }));
                   });
                   for (const link of domLinks) {
+                    const lowerHref = link.href.toLowerCase();
+                    if (lowerHref.includes('list=rd') || lowerHref.includes('start_radio=')) continue;
                     const vid = extractYouTubeVideoId(link.href);
                     if (vid) {
                       page1Candidates.push({
@@ -993,8 +890,9 @@ export async function runExactLinkSession(params: {
                     }
                   }
                 }
-              } catch {
-                // Chromium timed out on YouTube JS; proxy HTTPS search fallback runs below
+              } catch (searchErr) {
+                lastSearchProxyError =
+                  searchErr instanceof Error ? searchErr.message : String(searchErr);
               }
             }
 
@@ -1003,8 +901,7 @@ export async function runExactLinkSession(params: {
               const agent = proxy ? createProxyAgent(proxy, 5500) : undefined;
               try {
                 const res = await httpsGetWithAgent(ytSearchUrl, agent, 6500, {
-                  'User-Agent': fp.userAgent,
-                  'Accept-Language': fp.acceptLanguage,
+                  ...buildChromeAlignedHeaders(fp),
                   Cookie:
                     'SOCS=CAESHAgBEhJnd3NfMjAyMzA4MTAtMF9SQzEaAmRlIAEaBgiA_LyaBg; CONSENT=YES+cb.20210328-17-p0.en+FX+999',
                 });
@@ -1013,8 +910,9 @@ export async function runExactLinkSession(params: {
                 continuationToken = ctx.continuationToken;
                 apiKey = ctx.apiKey;
                 clientVersion = ctx.clientVersion;
-              } catch {
-                // Ignore and fall back to DuckDuckGo below if still empty
+              } catch (httpsErr) {
+                lastSearchProxyError =
+                  httpsErr instanceof Error ? httpsErr.message : String(httpsErr);
               } finally {
                 agent?.destroy();
               }
@@ -1047,8 +945,7 @@ export async function runExactLinkSession(params: {
                         agent,
                         5000,
                         {
-                          'User-Agent': fp.userAgent,
-                          'Accept-Language': fp.acceptLanguage,
+                          ...buildChromeAlignedHeaders(fp),
                         }
                       );
                       if (contRes.status !== 200) break;
@@ -1075,14 +972,24 @@ export async function runExactLinkSession(params: {
                     const scrolledLinks = await page
                       .evaluate(() => {
                         const anchors = Array.from(document.querySelectorAll('a#video-title, a[href*="/watch?v="]'));
-                        return anchors.slice(0, 120).map((a) => ({
-                          href: (a as HTMLAnchorElement).href,
-                          title: (a.textContent || '').trim(),
-                        }));
+                        return anchors
+                          .filter(
+                            (a) =>
+                              !a.closest(
+                                'ytd-ad-slot-renderer, ytd-promoted-sparkles-web-renderer, ytd-promoted-video-renderer, ytd-radio-renderer'
+                              )
+                          )
+                          .slice(0, 120)
+                          .map((a) => ({
+                            href: (a as HTMLAnchorElement).href,
+                            title: (a.textContent || '').trim(),
+                          }));
                       })
                       .catch(() => []);
                     const batch: ParsedSearchCandidate[] = [];
                     for (const link of scrolledLinks) {
+                      const lowerHref = link.href.toLowerCase();
+                      if (lowerHref.includes('list=rd') || lowerHref.includes('start_radio=')) continue;
                       const vid = extractYouTubeVideoId(link.href);
                       if (vid) {
                         batch.push({
@@ -1113,8 +1020,8 @@ export async function runExactLinkSession(params: {
                 if (parsedDdg.candidates.length > 0) {
                   inspectBatch(parsedDdg.candidates, 1, queryRankCursor, query);
                 }
-              } catch {
-                // Ignore DDG fallback failure
+              } catch (ddgErr) {
+                lastSearchProxyError = ddgErr instanceof Error ? ddgErr.message : String(ddgErr);
               } finally {
                 agent?.destroy();
               }
@@ -1141,8 +1048,8 @@ export async function runExactLinkSession(params: {
                 const parsed = parseDuckDuckGoCandidates(res.body);
                 page1List = parsed.candidates;
                 nextParams = parsed.nextFormParams;
-              } catch {
-                // Ignore
+              } catch (ddgErr) {
+                lastSearchProxyError = ddgErr instanceof Error ? ddgErr.message : String(ddgErr);
               } finally {
                 agent?.destroy();
               }
@@ -1197,6 +1104,14 @@ export async function runExactLinkSession(params: {
 
         const matchedCandidate = matchState.candidate;
         if (!matchedCandidate) {
+          if (
+            decisions.length === 0 &&
+            proxy &&
+            lastSearchProxyError &&
+            isRetryableProxyErrorMessage(lastSearchProxyError)
+          ) {
+            throw new Error(lastSearchProxyError);
+          }
           current = {
             ...current,
             status: 'not-found',
@@ -1253,19 +1168,80 @@ export async function runExactLinkSession(params: {
         let sessionDepthTitle: string | null = null;
 
         try {
-          const clickableSelector = isYouTubeTarget
-            ? `a[href*="${matchedCandidate.videoId}"]`
-            : `a[href="${matchedCandidate.url}"]`;
-          const locator = page.locator(clickableSelector).first();
-          const isVisibleOnPage = await locator.isVisible().catch(() => false);
+          let navigatedViaOrganicClick = false;
 
-          if (isVisibleOnPage) {
-            const [response] = await Promise.all([
-              page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 14000 }).catch(() => null),
-              locator.click({ timeout: 4500 }).catch(() => null),
-            ]);
-            httpStatus = response ? response.status() : 200;
+          if (isYouTubeTarget && matchedCandidate.videoId) {
+            const targetVid = matchedCandidate.videoId;
+            const candidateHrefs = await page
+              .evaluate((vid: string) => {
+                const anchors = Array.from(document.querySelectorAll('a[href]')) as HTMLAnchorElement[];
+                for (const a of anchors) {
+                  a.removeAttribute('data-nexus-exact-target');
+                }
+                for (const a of anchors) {
+                  if (
+                    a.closest(
+                      'ytd-ad-slot-renderer, ytd-promoted-sparkles-web-renderer, ytd-promoted-video-renderer, ytd-radio-renderer'
+                    )
+                  ) {
+                    continue;
+                  }
+                  const href = a.href || a.getAttribute('href') || '';
+                  const lower = href.toLowerCase();
+                  if (lower.includes('list=rd') || lower.includes('start_radio=')) continue;
+                  const rect = a.getBoundingClientRect();
+                  if (rect.width <= 0 || rect.height <= 0) continue;
+                  const matchWatch = href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+                  const matchShort = href.match(/\/shorts\/([a-zA-Z0-9_-]{11})/);
+                  const foundVid = matchWatch?.[1] || matchShort?.[1] || null;
+                  if (foundVid === vid) {
+                    a.setAttribute('data-nexus-exact-target', '1');
+                    return href;
+                  }
+                }
+                return null;
+              }, targetVid)
+              .catch(() => null);
+
+            if (candidateHrefs && isDirectYouTubeWatchHref(candidateHrefs, targetVid)) {
+              const exactLoc = page.locator('a[data-nexus-exact-target="1"]').first();
+              if (await exactLoc.isVisible({ timeout: 1000 }).catch(() => false)) {
+                const [response] = await Promise.all([
+                  page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 14000 }).catch(() => null),
+                  humanizeWatchCurve
+                    ? humanClickLocator(page, exactLoc, cursorPos, current.sessionIndex * 17 + 3).then(
+                        (pos) => {
+                          cursorPos = pos;
+                          return null;
+                        }
+                      )
+                    : exactLoc.click({ timeout: 4500 }).catch(() => null),
+                ]);
+                httpStatus = response ? response.status() : 200;
+                navigatedViaOrganicClick = true;
+              }
+            }
           } else {
+            const locator = page.locator(`a[href="${matchedCandidate.url}"]`).first();
+            const isVisibleOnPage = await locator.isVisible().catch(() => false);
+            if (isVisibleOnPage) {
+              const [response] = await Promise.all([
+                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 14000 }).catch(() => null),
+                humanizeWatchCurve
+                  ? humanClickLocator(page, locator, cursorPos, current.sessionIndex * 19 + 5).then(
+                      (pos) => {
+                        cursorPos = pos;
+                        return null;
+                      }
+                    )
+                  : locator.click({ timeout: 4500 }).catch(() => null),
+              ]);
+              httpStatus = response ? response.status() : 200;
+              navigatedViaOrganicClick = true;
+            }
+          }
+
+          if (!navigatedViaOrganicClick) {
             const response = await page.goto(matchedCandidate.url, {
               waitUntil: 'domcontentloaded',
               timeout: 14000,
@@ -1287,11 +1263,67 @@ export async function runExactLinkSession(params: {
             }
           }
 
-          const bodyText = await page.evaluate(() => document.body?.innerText?.slice(0, 3000) || '').catch(() => '');
-          const liveTitle = (await page.title().catch(() => '')) || matchedCandidate.title;
-          resolvedTitle = liveTitle.trim() || matchedCandidate.title;
+          let gateInspect = await inspectLiveTrafficGate(page, matchedCandidate.title, telemetry);
+          let gate = gateInspect.gate;
+          if (telemetry.blockedHttpStatus && !httpStatus) {
+            httpStatus = telemetry.blockedHttpStatus;
+          }
+          resolvedTitle = gateInspect.liveTitle || matchedCandidate.title;
 
-          const gate = detectTrafficGateFromPage(bodyText, page.url(), resolvedTitle);
+          // Strict URL verification: if organic click opened a Mix/Ad/wrong video or stayed on /results, force exact target URL
+          if (!gate.blocked) {
+            const currentUrl = page.url();
+            const needsExactRecovery = isYouTubeTarget
+              ? extractYouTubeVideoId(currentUrl) !== matchedCandidate.videoId ||
+                /list=rd|start_radio=/i.test(currentUrl)
+              : !isExactTargetMatch(currentUrl, matchedCandidate.url).matched;
+
+            if (needsExactRecovery) {
+              const response = await page.goto(matchedCandidate.url, {
+                waitUntil: 'domcontentloaded',
+                timeout: 14000,
+              });
+              httpStatus = response ? response.status() : httpStatus ?? 200;
+              await page.waitForTimeout(1000);
+
+              if (config.autoDismissCookies) {
+                const retryConsent = await dismissCookieConsentIfPresent(page);
+                if (retryConsent.dismissed) {
+                  current = {
+                    ...current,
+                    consentDismissed: true,
+                    consentButtonLabel: retryConsent.label,
+                    trafficStatus: 'consent-passed',
+                  };
+                }
+              }
+
+              gateInspect = await inspectLiveTrafficGate(page, matchedCandidate.title, telemetry);
+              gate = gateInspect.gate;
+              resolvedTitle = gateInspect.liveTitle || matchedCandidate.title;
+
+              if (!gate.blocked) {
+                const verifiedUrl = page.url();
+                const stillMismatch = isYouTubeTarget
+                  ? extractYouTubeVideoId(verifiedUrl) !== matchedCandidate.videoId ||
+                    /list=rd|start_radio=/i.test(verifiedUrl)
+                  : !isExactTargetMatch(verifiedUrl, matchedCandidate.url).matched;
+                if (stillMismatch) {
+                  current = {
+                    ...current,
+                    status: 'not-found',
+                    matchedUrl: null,
+                    durationMs: Date.now() - startedAt,
+                    error: `Açılan sayfa hedefle uyuşmadı (${verifiedUrl.slice(0, 90)}); yanlış içerik izletilmedi.`,
+                    updatedAt: new Date().toISOString(),
+                  };
+                  onUpdate(current);
+                  return current;
+                }
+              }
+            }
+          }
+
           if (gate.blocked) {
             playbackStatus = 'blocked';
             current = {
@@ -1309,7 +1341,7 @@ export async function runExactLinkSession(params: {
 
           if (!gate.blocked) {
             if (effectiveWatchTarget > 0) {
-              await page.waitForSelector('video', { timeout: 6000 }).catch(() => null);
+              await page.waitForSelector('video', { timeout: isYouTubeTarget ? 11000 : 6000 }).catch(() => null);
               const hasVideo = await page.evaluate(() => Boolean(document.querySelector('video'))).catch(() => false);
 
               if (!hasVideo) {
@@ -1332,8 +1364,22 @@ export async function runExactLinkSession(params: {
                         | (HTMLElement & { setPlaybackQualityRange?: (min: string, max: string) => void })
                         | null;
                       mp?.setPlaybackQualityRange?.('tiny', 'small');
+                      const autoNav = document.querySelector(
+                        'button.ytp-autonav-toggle-button[aria-checked="true"]'
+                      ) as HTMLButtonElement | null;
+                      autoNav?.click();
                     })
                     .catch(() => undefined);
+                }
+
+                const refreshedTitle = (await page.title().catch(() => '')).trim();
+                if (
+                  refreshedTitle &&
+                  refreshedTitle !== 'YouTube' &&
+                  refreshedTitle !== '- YouTube' &&
+                  !refreshedTitle.startsWith('http')
+                ) {
+                  resolvedTitle = refreshedTitle;
                 }
 
                 if (config.autoClickActionButton || isYouTubeTarget) {
@@ -1364,8 +1410,8 @@ export async function runExactLinkSession(params: {
                   videoDurationSeconds: null,
                   playbackStatus: 'playing',
                   profileState,
-                  watchtimePingCount,
-                  lastWatchtimePingStatus,
+                  watchtimePingCount: telemetry.watchtimePingCount,
+                  lastWatchtimePingStatus: telemetry.lastWatchtimePingStatus,
                   updatedAt: new Date().toISOString(),
                 };
                 onUpdate(current);
@@ -1385,16 +1431,19 @@ export async function runExactLinkSession(params: {
                   if (signal.aborted || hardTimedOut) break;
                   tickCount++;
 
-                  // Humanized engagement micro-behaviors: gentle comment scroll & natural cursor presence
+                  // Synthetic human behavior layer: multi-impulse scroll & cubic Bézier pointer arcs
                   if (humanizeWatchCurve && isYouTubeTarget) {
+                    const behaviorSeed = current.sessionIndex * 101 + tickCount * 13;
                     if (tickCount === 4) {
-                      await page.mouse.wheel(0, 240).catch(() => undefined);
+                      await humanScroll(page, 230 + (current.sessionIndex % 9) * 14, behaviorSeed);
                     } else if (tickCount === 9) {
-                      await page.mouse.wheel(0, -240).catch(() => undefined);
+                      await humanScroll(page, -(210 + (current.sessionIndex % 7) * 12), behaviorSeed);
                     } else if (tickCount % 8 === 0) {
-                      await page.mouse
-                        .move(280 + ((tickCount * 19) % 240), 220 + ((tickCount * 13) % 120))
-                        .catch(() => undefined);
+                      const nextTarget: Point2D = {
+                        x: Math.min(fp.viewport.width - 80, 240 + ((behaviorSeed * 19) % 420)),
+                        y: Math.min(fp.viewport.height - 80, 180 + ((behaviorSeed * 13) % 260)),
+                      };
+                      cursorPos = await humanMoveMouse(page, cursorPos, nextTarget, behaviorSeed);
                     }
                   }
 
@@ -1411,21 +1460,22 @@ export async function runExactLinkSession(params: {
                       }
                     }
 
-                    const midBodyText = await withHardTimeout(
-                      page.evaluate(() => document.body?.innerText?.slice(0, 2000) || ''),
-                      2500,
-                      'body-eval-timeout'
-                    ).catch(() => '');
-                    const midTitle =
-                      (await withHardTimeout(page.title(), 2500, 'title-timeout').catch(() => '')) ||
-                      resolvedTitle;
-                    const midGate = detectTrafficGateFromPage(midBodyText, page.url(), midTitle);
-                    if (midGate.blocked) {
+                    const midInspect = await inspectLiveTrafficGate(page, resolvedTitle, telemetry);
+                    if (
+                      midInspect.liveTitle &&
+                      midInspect.liveTitle !== 'YouTube' &&
+                      midInspect.liveTitle !== '- YouTube' &&
+                      !midInspect.liveTitle.startsWith('http')
+                    ) {
+                      resolvedTitle = midInspect.liveTitle;
+                    }
+                    if (midInspect.gate.blocked) {
+                      gate = midInspect.gate;
                       playbackStatus = 'blocked';
                       current = {
                         ...current,
                         trafficStatus: 'bot-gate-detected',
-                        trafficGateReason: midGate.reason,
+                        trafficGateReason: midInspect.gate.reason,
                       };
                       break;
                     }
@@ -1446,6 +1496,7 @@ export async function runExactLinkSession(params: {
                           ?.textContent?.trim()
                       );
                       return {
+                        currentUrl: location.href,
                         paused: v.paused,
                         currentTime: v.currentTime,
                         duration: v.duration,
@@ -1461,6 +1512,15 @@ export async function runExactLinkSession(params: {
 
                   if (signal.aborted || hardTimedOut) break;
                   if (!sample) continue;
+
+                  // Mid-watch URL lock: stop immediately if Autoplay or redirect jumped to a different video
+                  if (isYouTubeTarget && matchedCandidate.videoId) {
+                    const liveVid = extractYouTubeVideoId(sample.currentUrl);
+                    if (liveVid && liveVid !== matchedCandidate.videoId) {
+                      endedReached = watchedSeconds > 0;
+                      break;
+                    }
+                  }
 
                   // If YouTube drops buffered stream past ~58s ("Something went wrong. Refresh..."), reload at exact timestamp
                   if (
@@ -1538,13 +1598,14 @@ export async function runExactLinkSession(params: {
                   current = {
                     ...current,
                     status: 'watching',
+                    resolvedTitle,
                     playbackStatus: 'playing',
                     watchSecondsActual,
                     targetWatchSeconds: effectiveWatchTarget,
                     videoDurationSeconds,
                     profileState,
-                    watchtimePingCount,
-                    lastWatchtimePingStatus,
+                    watchtimePingCount: telemetry.watchtimePingCount,
+                    lastWatchtimePingStatus: telemetry.lastWatchtimePingStatus,
                     updatedAt: new Date().toISOString(),
                   };
                   onUpdate(current);
@@ -1582,16 +1643,21 @@ export async function runExactLinkSession(params: {
             }
           }
 
+          // Isolate screenshot capture so slow proxy image rendering never wipes watch metrics or triggers navErr
           if (config.captureProofScreenshot) {
-            ensureProofsDir();
-            if (isYouTubeTarget) {
-              await page.locator('#movie_player').hover({ timeout: 1000 }).catch(() => undefined);
-              await page.waitForTimeout(250);
+            try {
+              ensureProofsDir();
+              if (isYouTubeTarget) {
+                await page.locator('#movie_player').hover({ timeout: 1000 }).catch(() => undefined);
+                await page.waitForTimeout(250);
+              }
+              const fileName = `${runId}-s${current.sessionIndex}.png`;
+              const outPath = path.join(PROOFS_DIR, fileName);
+              await page.screenshot({ path: outPath, fullPage: false, timeout: 9000 });
+              screenshotUrl = `/api/proofs/${fileName}`;
+            } catch {
+              // Non-fatal screenshot timeout; keep verified playback metrics intact
             }
-            const fileName = `${runId}-s${current.sessionIndex}.png`;
-            const outPath = path.join(PROOFS_DIR, fileName);
-            await page.screenshot({ path: outPath, fullPage: false, timeout: 8500 });
-            screenshotUrl = `/api/proofs/${fileName}`;
           }
 
           // Session depth: after completing target watch + capturing proof, organically transition to 1 related video
@@ -1613,6 +1679,8 @@ export async function runExactLinkSession(params: {
                   );
                   for (const el of links) {
                     const href = (el as HTMLAnchorElement).href || '';
+                    const lower = href.toLowerCase();
+                    if (lower.includes('list=rd') || lower.includes('start_radio=')) continue;
                     const m = href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
                     if (m && m[1] !== excludeVid) {
                       const title =
@@ -1649,21 +1717,23 @@ export async function runExactLinkSession(params: {
             }
           }
 
-          // Persist warmed browser cookies/storage for future runs if session stayed unblocked
-          if (config.enableProfileWarmup !== false && !gate.blocked) {
-            try {
-              ensureProfilesDir();
-              await context.storageState({ path: profilePath });
-              if (profileState === 'cold') {
-                profileState = 'warmed';
-              }
-            } catch {
-              // Ignore non-fatal storage save errors
-            }
+          // Quarantine blocked profiles (403/429/bot-gate) immediately; persist healthy warmed units
+          if (gate.blocked) {
+            quarantineProfile(profileUnit, gate.reason || 'Bot/WAF engeli algılandı');
+            profileState = 'quarantined';
+          } else if (config.enableProfileWarmup !== false) {
+            profileState = await persistWarmProfile(profileUnit, context);
           }
         } catch (navErr) {
           if (hardTimedOut || signal.aborted) {
             return current;
+          }
+          const navMsg = navErr instanceof Error ? navErr.message : String(navErr);
+          if (
+            proxy &&
+            (isRetryableProxyErrorMessage(navMsg) || navMsg.toLowerCase().includes('timeout'))
+          ) {
+            throw navErr;
           }
           const agent = proxy ? createProxyAgent(proxy, 6500) : undefined;
           try {
@@ -1703,13 +1773,14 @@ export async function runExactLinkSession(params: {
           videoDurationSeconds,
           playbackStatus,
           profileState,
-          watchtimePingCount,
-          lastWatchtimePingStatus,
+          watchtimePingCount: telemetry.watchtimePingCount,
+          lastWatchtimePingStatus: telemetry.lastWatchtimePingStatus,
           sessionDepthUrl,
           sessionDepthTitle,
           durationMs: Date.now() - startedAt,
           updatedAt: new Date().toISOString(),
         };
+        telemetry.detach();
         onUpdate(current);
         return current;
       })(),
@@ -2080,12 +2151,9 @@ export async function runOsintPlatformCheck(params: {
     if (config.captureProofScreenshot && scored.isExactTarget) {
       try {
         ensureProofsDir();
-        const browser = await getSharedBrowser();
-        const ctx = await browser.newContext({
-          proxy: proxy ? { server: `${proxy.protocol}://${proxy.host}:${proxy.port}` } : undefined,
-          userAgent: fp.userAgent,
-          viewport: fp.viewport,
-          ignoreHTTPSErrors: true,
+        const ctx = await createHardenedContext({
+          proxy,
+          fingerprint: fp,
         });
         try {
           const page = await ctx.newPage();

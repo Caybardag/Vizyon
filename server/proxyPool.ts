@@ -1,11 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import http from 'node:http';
-import https from 'node:https';
-import net from 'node:net';
 import crypto from 'node:crypto';
-import { HttpsProxyAgent } from 'https-proxy-agent';
-import { SocksProxyAgent } from 'socks-proxy-agent';
 import type {
   HarvestProgress,
   ParsedProxyEndpoint,
@@ -13,8 +8,17 @@ import type {
   ProxyNetworkType,
   ProxyProtocol,
 } from '../src/types/automation';
-import { classifyNetworkType, parseProxyLines, safeJsonParse } from '../src/lib/targetMatcher';
+import { parseProxyLines, safeJsonParse } from '../src/lib/targetMatcher';
 import { eventBus } from './eventBus';
+import {
+  createProxyAgent,
+  httpsGetWithAgent,
+  httpsPostJsonWithAgent,
+  lookupGeoForIp,
+  tcpConnectCheck,
+} from './layers/networkLayer';
+
+export { createProxyAgent, httpsGetWithAgent, httpsPostJsonWithAgent, tcpConnectCheck };
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const PROXIES_FILE = path.join(DATA_DIR, 'proxies.json');
@@ -87,284 +91,6 @@ function makeProxyId(protocol: ProxyProtocol, host: string, port: number): strin
   return crypto.createHash('sha1').update(`${protocol}://${host}:${port}`).digest('hex').slice(0, 12);
 }
 
-export function tcpConnectCheck(host: string, port: number, timeoutMs = 2500): Promise<void> {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let socket: net.Socket | null = null;
-    let timer: NodeJS.Timeout | null = null;
-
-    const finish = (err?: Error) => {
-      if (settled) return;
-      settled = true;
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
-      if (socket && !socket.destroyed) {
-        try {
-          socket.destroy();
-        } catch {
-          // ignore
-        }
-      }
-      if (err) reject(err);
-      else resolve();
-    };
-
-    try {
-      socket = net.connect({ host, port });
-      // Keep error handler attached for the entire socket lifetime so late OS ETIMEDOUT/ECONNRESET never crashes/logs uncaughtException.
-      socket.on('error', (err) => finish(err instanceof Error ? err : new Error(String(err))));
-      socket.on('timeout', () => finish(new Error(`TCP connect timeout ${host}:${port}`)));
-      socket.on('connect', () => finish());
-      socket.setTimeout(timeoutMs);
-
-      timer = setTimeout(() => {
-        finish(new Error(`TCP connect timeout ${host}:${port}`));
-      }, timeoutMs + 150);
-    } catch (err) {
-      finish(err instanceof Error ? err : new Error(String(err)));
-    }
-  });
-}
-
-export function createProxyAgent(
-  proxy: Pick<ProxyEndpoint, 'protocol' | 'host' | 'port'>,
-  timeoutMs = 5000
-) {
-  const proxyUrl = `${proxy.protocol}://${proxy.host}:${proxy.port}`;
-  const agent =
-    proxy.protocol === 'socks4' || proxy.protocol === 'socks5'
-      ? new SocksProxyAgent(proxyUrl, { timeout: timeoutMs })
-      : new HttpsProxyAgent(proxyUrl, { timeout: timeoutMs });
-
-  const noopSocketError = () => {};
-  agent.on('error', noopSocketError);
-
-  const origConnect = agent.connect.bind(agent);
-  agent.connect = async (
-    req: Parameters<typeof agent.connect>[0],
-    opts: Parameters<typeof agent.connect>[1]
-  ) => {
-    const sock = await origConnect(req, opts);
-    if (sock && typeof sock.on === 'function' && !sock.listeners('error').includes(noopSocketError)) {
-      sock.on('error', noopSocketError);
-    }
-    return sock;
-  };
-
-  return agent;
-}
-
-export function httpsGetWithAgent(
-  targetUrl: string,
-  agent: http.Agent | undefined,
-  timeoutMs: number,
-  headers: Record<string, string> = {}
-): Promise<{ status: number; body: string }> {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let req: http.ClientRequest | null = null;
-    let hardTimer: NodeJS.Timeout | null = null;
-
-    const cleanupTimer = () => {
-      if (hardTimer) {
-        clearTimeout(hardTimer);
-        hardTimer = null;
-      }
-    };
-
-    const fail = (err: unknown) => {
-      if (settled) return;
-      settled = true;
-      cleanupTimer();
-      if (req && !req.destroyed) {
-        try {
-          req.destroy();
-        } catch {
-          // ignore
-        }
-      }
-      reject(err instanceof Error ? err : new Error(String(err)));
-    };
-
-    const onTimeout = () => fail(new Error('Request timeout'));
-
-    try {
-      const parsed = new URL(targetUrl);
-      const mod = parsed.protocol === 'https:' ? https : http;
-      req = mod.request(
-        {
-          hostname: parsed.hostname,
-          port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-          path: `${parsed.pathname}${parsed.search}`,
-          method: 'GET',
-          // Disable shared global keep-alive socket pooling when no proxy agent is passed
-          // so each socket handles 1 request and never accumulates error listeners.
-          agent: agent ?? false,
-          timeout: timeoutMs,
-          rejectUnauthorized: false,
-          headers: {
-            'User-Agent':
-              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            Accept: 'application/json, text/html;q=0.9,*/*;q=0.8',
-            ...headers,
-          },
-        },
-        (res) => {
-          const chunks: Buffer[] = [];
-          let totalBytes = 0;
-
-          res.on('error', fail);
-          res.on('aborted', () => fail(new Error('Response aborted')));
-          res.on('data', (chunk: Buffer) => {
-            totalBytes += chunk.length;
-            if (totalBytes <= 2_500_000) {
-              chunks.push(chunk);
-            }
-          });
-          res.on('end', () => {
-            if (settled) return;
-            settled = true;
-            cleanupTimer();
-            resolve({
-              status: res.statusCode ?? 0,
-              body: Buffer.concat(chunks).toString('utf8'),
-            });
-          });
-        }
-      );
-
-      // Keep error handlers attached across the full lifetime of req, socket, and underlying proxy TCP socket
-      // so deferred errors after timeout/abort are caught cleanly by fail() without firing uncaughtException.
-      req.on('socket', (socket: net.Socket) => {
-        if (!socket.listeners('error').includes(fail)) {
-          socket.on('error', fail);
-        }
-      });
-      req.on('proxy', (info: { socket?: net.Socket }) => {
-        if (info?.socket && !info.socket.listeners('error').includes(fail)) {
-          info.socket.on('error', fail);
-        }
-      });
-      req.on('timeout', onTimeout);
-      req.on('error', fail);
-
-      hardTimer = setTimeout(() => {
-        fail(new Error('Request timeout'));
-      }, timeoutMs + 500);
-
-      req.end();
-    } catch (err) {
-      fail(err);
-    }
-  });
-}
-
-export function httpsPostJsonWithAgent(
-  targetUrl: string,
-  payload: unknown,
-  agent: http.Agent | undefined,
-  timeoutMs: number,
-  headers: Record<string, string> = {}
-): Promise<{ status: number; body: string }> {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let req: http.ClientRequest | null = null;
-    let hardTimer: NodeJS.Timeout | null = null;
-
-    const cleanupTimer = () => {
-      if (hardTimer) {
-        clearTimeout(hardTimer);
-        hardTimer = null;
-      }
-    };
-
-    const fail = (err: unknown) => {
-      if (settled) return;
-      settled = true;
-      cleanupTimer();
-      if (req && !req.destroyed) {
-        try {
-          req.destroy();
-        } catch {
-          // ignore
-        }
-      }
-      reject(err instanceof Error ? err : new Error(String(err)));
-    };
-
-    try {
-      const parsed = new URL(targetUrl);
-      const mod = parsed.protocol === 'https:' ? https : http;
-      const bodyStr = JSON.stringify(payload);
-      req = mod.request(
-        {
-          hostname: parsed.hostname,
-          port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-          path: `${parsed.pathname}${parsed.search}`,
-          method: 'POST',
-          agent: agent ?? false,
-          timeout: timeoutMs,
-          rejectUnauthorized: false,
-          headers: {
-            'User-Agent':
-              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            'Content-Type': 'application/json',
-            'Content-Length': Buffer.byteLength(bodyStr).toString(),
-            Accept: 'application/json',
-            ...headers,
-          },
-        },
-        (res) => {
-          const chunks: Buffer[] = [];
-          let totalBytes = 0;
-
-          res.on('error', fail);
-          res.on('aborted', () => fail(new Error('Response aborted')));
-          res.on('data', (chunk: Buffer) => {
-            totalBytes += chunk.length;
-            if (totalBytes <= 3_000_000) {
-              chunks.push(chunk);
-            }
-          });
-          res.on('end', () => {
-            if (settled) return;
-            settled = true;
-            cleanupTimer();
-            resolve({
-              status: res.statusCode ?? 0,
-              body: Buffer.concat(chunks).toString('utf8'),
-            });
-          });
-        }
-      );
-
-      req.on('socket', (socket: net.Socket) => {
-        if (!socket.listeners('error').includes(fail)) {
-          socket.on('error', fail);
-        }
-      });
-      req.on('proxy', (info: { socket?: net.Socket }) => {
-        if (info?.socket && !info.socket.listeners('error').includes(fail)) {
-          info.socket.on('error', fail);
-        }
-      });
-      req.on('timeout', () => fail(new Error('Request timeout')));
-      req.on('error', fail);
-
-      hardTimer = setTimeout(() => {
-        fail(new Error('Request timeout'));
-      }, timeoutMs + 500);
-
-      req.write(bodyStr);
-      req.end();
-    } catch (err) {
-      fail(err);
-    }
-  });
-}
-
 async function lookupLocalPublicIp(): Promise<string | null> {
   try {
     const res = await httpsGetWithAgent('https://api.ipify.org?format=json', undefined, 4000);
@@ -376,43 +102,6 @@ async function lookupLocalPublicIp(): Promise<string | null> {
     return null;
   }
   return null;
-}
-
-async function lookupGeoForIp(ip: string): Promise<{
-  country: string | null;
-  countryCode: string | null;
-  isp: string | null;
-  networkType: ProxyNetworkType;
-}> {
-  try {
-    const res = await httpsGetWithAgent(
-      `http://ip-api.com/json/${encodeURIComponent(ip)}?fields=status,country,countryCode,isp,org,hosting`,
-      undefined,
-      3000
-    );
-    if (res.status === 200) {
-      const data = JSON.parse(res.body) as {
-        status?: string;
-        country?: string;
-        countryCode?: string;
-        isp?: string;
-        org?: string;
-        hosting?: boolean;
-      };
-      if (data.status === 'success') {
-        const isp = data.isp ?? data.org ?? null;
-        return {
-          country: data.country ?? null,
-          countryCode: data.countryCode ?? null,
-          isp,
-          networkType: classifyNetworkType(data.hosting, data.isp, data.org),
-        };
-      }
-    }
-  } catch {
-    // Non-fatal metadata enrichment
-  }
-  return { country: null, countryCode: null, isp: null, networkType: 'unknown' };
 }
 
 class ProxyPoolManager {
@@ -626,6 +315,9 @@ class ProxyPoolManager {
         exitIp,
         country: geo.country,
         countryCode: geo.countryCode,
+        timezone: geo.timezone,
+        lat: geo.lat,
+        lon: geo.lon,
         isp: geo.isp,
         networkType: geo.networkType,
         latencyMs,

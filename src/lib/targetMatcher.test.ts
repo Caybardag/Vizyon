@@ -276,3 +276,60 @@ test('isYouTubeWatchTelemetryUrl, computeHumanizedWatchTarget, and buildRankTren
   assert.equal(series[1].telemetryRatePercent, 67);
   assert.equal(series[1].ispMatchedCount, 2);
 });
+
+import { isDirectYouTubeWatchHref } from './targetMatcher';
+
+test('isDirectYouTubeWatchHref rejects YouTube Mix/Radio, ad redirects, and wrong video IDs', () => {
+  assert.equal(isDirectYouTubeWatchHref('/watch?v=E4tAzCROfko&pp=ygUIdGVzdA%3D%3D', 'E4tAzCROfko'), true);
+  assert.equal(isDirectYouTubeWatchHref('https://www.youtube.com/shorts/E4tAzCROfko', 'E4tAzCROfko'), true);
+  assert.equal(
+    isDirectYouTubeWatchHref('/watch?v=E4tAzCROfko&list=RDE4tAzCROfko&start_radio=1', 'E4tAzCROfko'),
+    false
+  );
+  assert.equal(
+    isDirectYouTubeWatchHref('/watch?v=BLACKPINK11&list=RDE4tAzCROfko&start_radio=1', 'E4tAzCROfko'),
+    false
+  );
+  assert.equal(
+    isDirectYouTubeWatchHref('https://www.googleadservices.com/pagead/aclk?v=E4tAzCROfko', 'E4tAzCROfko'),
+    false
+  );
+  assert.equal(isDirectYouTubeWatchHref('/watch?v=OTHERVIDEO1', 'E4tAzCROfko'), false);
+});
+
+test('extractYouTubeCandidatesFromHtml skips ad renderers, radioRenderer mixes, and RD mix lockups', () => {
+  const fakeHtml = `<html><script>var ytInitialData = {"contents":{"a":[
+    {"adSlotRenderer":{"videoId":"AdVideo12345"}},
+    {"promotedVideoRenderer":{"videoId":"Promo123456"}},
+    {"radioRenderer":{"playlistId":"RDE4tAzCROfko","videos":[{"childVideoRenderer":{"videoId":"E4tAzCROfko"}}]}},
+    {"lockupViewModel":{"contentId":"RDE4tAzCROfko","contentType":"LOCKUP_CONTENT_TYPE_PLAYLIST","metadata":{"lockupMetadataViewModel":{"title":{"content":"Mix - Target"}}}}},
+    {"videoRenderer":{"videoId":"E4tAzCROfko","title":{"runs":[{"text":"Real Target Video"}]}}}
+  ]}};</script></html>`;
+  const ctx = extractYouTubeSearchContext(fakeHtml);
+  assert.equal(ctx.candidates.length, 1);
+  assert.equal(ctx.candidates[0].videoId, 'E4tAzCROfko');
+  assert.equal(ctx.candidates[0].title, 'Real Target Video');
+});
+
+test('detectTrafficGateFromPage catches Polish and Chinese bot-login gates and isRetryableProxyErrorMessage catches Playwright net errors', () => {
+  assert.equal(
+    detectTrafficGateFromPage(
+      'Zaloguj się, by potwierdzić, że nie jesteś botem. Pomaga to chronić naszą społeczność.',
+      'https://www.youtube.com/watch?v=E4tAzCROfko',
+      'YouTube'
+    ).gateType,
+    'signin-bot-check'
+  );
+  assert.equal(
+    detectTrafficGateFromPage(
+      '請登入以確認你並非機械人 登入',
+      'https://www.youtube.com/watch?v=E4tAzCROfko',
+      'YouTube'
+    ).gateType,
+    'signin-bot-check'
+  );
+  assert.equal(isRetryableProxyErrorMessage('page.goto: net::ERR_PROXY_CONNECTION_FAILED at https://www.youtube.com/'), true);
+  assert.equal(isRetryableProxyErrorMessage('page.goto: Timeout 18000ms exceeded.'), true);
+  assert.equal(isRetryableProxyErrorMessage('net::ERR_TUNNEL_CONNECTION_FAILED'), true);
+});
+

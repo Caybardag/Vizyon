@@ -14,6 +14,9 @@ export interface ProxyEndpoint {
   exitIp: string | null;
   country: string | null;
   countryCode: string | null;
+  timezone?: string | null;
+  lat?: number | null;
+  lon?: number | null;
   isp: string | null;
   networkType?: ProxyNetworkType;
   latencyMs: number | null;
@@ -61,7 +64,7 @@ export type SessionStatus =
 
 export type PlaybackStatus = 'idle' | 'playing' | 'completed' | 'stalled' | 'blocked' | 'no-video';
 
-export type ProfileWarmupState = 'cold' | 'warmed' | 'reused-warm';
+export type ProfileWarmupState = 'cold' | 'warmed' | 'reused-warm' | 'quarantined';
 
 export interface SessionExecution {
   sessionId: string;
@@ -71,10 +74,19 @@ export interface SessionExecution {
   protocol: ProxyProtocol;
   exitIp: string;
   country: string | null;
+  countryCode?: string | null;
   networkType?: ProxyNetworkType;
   userAgent: string;
   locale: string;
   timezoneId?: string;
+  osPlatform?: string;
+  webglRenderer?: string;
+  screenResolution?: string;
+  consistencyScore?: number;
+  cdpHardened?: boolean;
+  tlsProfile?: string;
+  behaviorMode?: 'bezier-human' | 'standard';
+  failoverCount?: number;
   status: SessionStatus;
   searchQuery: string;
   matchedQuery?: string | null;
